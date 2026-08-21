@@ -120,7 +120,7 @@ def _load_nostr_auth():
     the test plugin loader, where relative imports have no parent package.
     """
     try:
-        from . import nostr_auth  # type: ignore[no-redef]
+        from . import nostr_auth
 
         return nostr_auth
     except ImportError:
@@ -381,10 +381,11 @@ class BuzzAdapter(BasePlatformAdapter):
             interval = _DEFAULT_POLL_INTERVAL
         self.poll_interval = max(_MIN_POLL_INTERVAL, interval)
 
-        # Whether channel messages must @mention the agent to get a response.
-        # Defaults to True (respond only when addressed). Set False to make the
-        # agent respond to every message in a watched channel. DMs always
-        # dispatch regardless. Env (BUZZ_REQUIRE_MENTION) overrides config.yaml.
+        # Whether channel messages must structurally p-tag the agent to get a
+        # response. Defaults to True (respond only when addressed). Set False
+        # to make the agent respond to every message in a watched channel. DMs
+        # always dispatch regardless. Env (BUZZ_REQUIRE_MENTION) overrides
+        # config.yaml.
         _rm_raw = os.getenv("BUZZ_REQUIRE_MENTION")
         if _rm_raw is None:
             _rm_cfg = extra.get("require_mention", True)
@@ -473,7 +474,8 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
 
         # Learn our own identity: pubkey drives self-echo suppression and
-        # display name drives channel mention gating.
+        # structural channel mention gating; display name is only used for
+        # prompt cleanup / DM-shape heuristics.
         code, out, err = await self._run_cli(["users", "get"])
         if code != 0:
             message = _cli_error_message(err, code)
@@ -1030,10 +1032,12 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
-        # In shared channels, respond only when addressed — unless
+        # In shared channels, respond only when the current signed event
+        # structurally addresses us with a ["p", self_pubkey] tag — unless
         # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        # Plain text names, npubs, hex pubkeys, reply ancestry, and historical
+        # mentions do not address this event. DMs always dispatch.
+        if not is_dm and self.require_mention and not self._has_self_p_tag(event):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
@@ -1069,20 +1073,21 @@ class BuzzAdapter(BasePlatformAdapter):
     #   * every message another user sends IN A DM carries a structural
     #     ["p", <our pubkey>] tag, even when the text never mentions us
     #     (recipient addressing);
-    #   * in a real channel, a ["p", <our pubkey>] tag appears only when the
-    #     text visibly @mentions us (typed mention, with or without a reply
-    #     ["e", ...] tag) — never on plain broadcasts.
+    #   * in a real channel, metadata has a normal channel name or
+    #     description, so p-tags there are treated as structural channel
+    #     addressing rather than as evidence that the conversation is a DM.
     #
     # So "p-tagged to self WITHOUT a visible mention in the content" is the
-    # DM discriminator: in a channel that combination does not occur, and a
-    # channel reply/mention that p-tags us is excluded because the mention
-    # is right there in the text.  As a second, independent guard, a
+    # DM discriminator only for conversations whose metadata can be a relay-
+    # materialized DM. Real channel metadata prevents channel p-tags from
+    # being interpreted as a DM latch. As a second, independent guard, a
     # conversation whose ``channels list`` metadata looks like a real
     # community channel (real name / non-empty description) is never
     # reclassified at all, whereas relay-materialized DMs are always named
     # "DM" with an empty description.  Nothing is lost while unlatched: a
-    # DM message that DOES mention us dispatches through the mention gate
-    # anyway, so the latch flips exactly on the first message that needs it.
+    # DM message that DOES visibly mention us still dispatches through the
+    # structural p-tag channel gate, so the latch flips exactly on the first
+    # message that needs the DM exemption.
 
     def _may_reclassify_as_dm(self, channel_id: str) -> bool:
         """True when the conversation's metadata does not rule out a DM.
@@ -1124,7 +1129,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not p_tagged_to_self:
             return False
         content = event.get("content")
-        return isinstance(content, str) and not self._is_mentioned(content)
+        return isinstance(content, str) and not self._content_mentions_self(content)
 
     def _maybe_latch_dm(self, channel_id: str, state: dict, event: dict) -> None:
         """Latch a group conversation to chat_type="dm" once any direct
@@ -1136,8 +1141,28 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_names.setdefault(channel_id, "DM")
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
 
-    def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+    def _has_self_p_tag(self, event: dict) -> bool:
+        """True when the current signed event structurally p-tags this agent."""
+        if not self._self_pubkey:
+            return False
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        return any(
+            isinstance(tag, (list, tuple))
+            and len(tag) > 1
+            and tag[0] == "p"
+            and str(tag[1]).lower() == self._self_pubkey
+            for tag in tags
+        )
+
+    def _content_mentions_self(self, content: str) -> bool:
+        """True when text visibly contains this agent's identity.
+
+        This is not a dispatch gate. It only distinguishes DM-shaped p-tags
+        from channel p-tags for legacy DM latching and supports leading mention
+        cleanup after a message has already been admitted.
+        """
         lowered = content.lower()
         if self._self_pubkey and self._self_pubkey in lowered:
             return True
@@ -1522,7 +1547,7 @@ def register(ctx):
         platform_hint=(
             "You are collaborating in a Buzz workspace (Block's Nostr-based "
             "human+agent platform). Markdown IS supported. Users address you "
-            "by @-mentioning your name or npub in channels; direct messages "
-            "reach you without a mention. Keep responses conversational."
+            "in channels through the current event's structured p-tag; direct "
+            "messages reach you without a mention. Keep responses conversational."
         ),
     )
