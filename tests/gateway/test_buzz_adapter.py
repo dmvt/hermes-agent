@@ -421,6 +421,27 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+    @pytest.mark.asyncio
+    async def test_local_media_dispatch_uses_file_attachment(self, tmp_path):
+        """The shared MEDIA image path dispatches through send_image_file."""
+        img = tmp_path / "generated.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send_multiple_images(
+            CHANNEL,
+            [(img.as_uri(), "generated image")],
+            metadata={"thread_id": "parent-event"},
+        )
+
+        args, stdin_text = cli.calls[0]
+        assert args[args.index("--file") + 1] == str(img)
+        assert args[args.index("--reply-to") + 1] == "parent-event"
+        assert stdin_text == "generated image"
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -536,5 +557,4 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
 
