@@ -381,6 +381,153 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
+# ── Reply-target resolution (threading rule) ──────────────────────────────
+#
+# Rule: tagged in a TOP-LEVEL channel message -> respond as a CHILD of that
+# message (starts a thread). Tagged in a message that is itself a reply ->
+# respond as a SIBLING at the same level (reply to that message's parent),
+# so agent responses never nest one level deeper per exchange. Sends with no
+# reply context at all (status notices, media, background summaries) follow
+# the most recent dispatched message's resolved target.
+
+
+class TestReplyTargetResolution:
+
+    @pytest.fixture
+    def adapter(self):
+        a = _make_adapter()
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_meta = {
+            CHANNEL: {
+                "channel_id": CHANNEL,
+                "name": "general",
+                "description": "General conversation and community updates.",
+            },
+        }
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        return a
+
+    async def _poll_with(self, adapter, *events):
+        cli = _ScriptedCli()
+        cli.script("messages", "get", list(events))
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+    async def _send(self, adapter, content="answer", reply_to=None, metadata=None):
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-out", "message": ""})
+        adapter._run_cli = cli
+        result = await adapter.send(CHANNEL, content, reply_to=reply_to, metadata=metadata)
+        assert result.success is True
+        return cli.calls[0][0]
+
+    @staticmethod
+    def _reply_to_arg(args):
+        return args[args.index("--reply-to") + 1] if "--reply-to" in args else None
+
+    def test_event_reply_parent_shapes(self):
+        parent = BuzzAdapter._event_reply_parent
+        # Top-level: no e tags at all.
+        assert parent({"tags": [["h", CHANNEL]]}) is None
+        # Marked reply wins over marked root.
+        assert parent({"tags": [["e", "root1", "", "root"], ["e", "mid1", "", "reply"]]}) == "mid1"
+        # Root-only marking (first-level thread reply).
+        assert parent({"tags": [["e", "root1", "", "root"]]}) == "root1"
+        # Unmarked legacy tags: positional NIP-10 — last one is the parent.
+        assert parent({"tags": [["e", "root1"], ["e", "mid1"]]}) == "mid1"
+
+    @pytest.mark.asyncio
+    async def test_top_level_mention_replies_as_child(self, adapter):
+        """Tagged in a top-level message: the response starts a thread there."""
+        await self._poll_with(
+            adapter,
+            _tagged_event("top1", CHANNEL, content="@Chip can you help?", p=SELF_PUBKEY),
+        )
+        assert [d["message_id"] for d in adapter._dispatched] == ["top1"]
+        # The gateway's reply anchor is the triggering message id.
+        args = await self._send(adapter, reply_to="top1")
+        assert self._reply_to_arg(args) == "top1"
+
+    @pytest.mark.asyncio
+    async def test_nested_mention_replies_as_sibling(self, adapter):
+        """Tagged in a thread reply: the response targets that reply's parent."""
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "nested1", CHANNEL, content="@Chip what about this?",
+                p=SELF_PUBKEY, reply_to="thread-root",
+            ),
+        )
+        assert [d["message_id"] for d in adapter._dispatched] == ["nested1"]
+        args = await self._send(adapter, reply_to="nested1")
+        assert self._reply_to_arg(args) == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_contextless_send_follows_triggering_message(self, adapter):
+        """Status/media/background sends carry no reply context — they must
+        land in the same reply context as the triggering message, not at the
+        channel root."""
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "nested2", CHANNEL, content="@Chip and this?",
+                p=SELF_PUBKEY, reply_to="thread-root",
+            ),
+        )
+        args = await self._send(adapter, content="status notice")
+        assert self._reply_to_arg(args) == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_thread_metadata_is_remapped_too(self, adapter):
+        """metadata.thread_id carrying the triggering id is remapped as well."""
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "nested3", CHANNEL, content="@Chip ping",
+                p=SELF_PUBKEY, reply_to="thread-root",
+            ),
+        )
+        args = await self._send(adapter, metadata={"thread_id": "nested3"})
+        assert self._reply_to_arg(args) == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_explicit_undispatched_target_passes_through(self, adapter):
+        """An explicit reply target that never triggered a dispatch (e.g. the
+        send-message tool replying to an arbitrary event) is used verbatim."""
+        args = await self._send(adapter, reply_to="some-other-event")
+        assert self._reply_to_arg(args) == "some-other-event"
+
+    @pytest.mark.asyncio
+    async def test_no_context_no_history_sends_to_channel_root(self, adapter):
+        args = await self._send(adapter)
+        assert self._reply_to_arg(args) is None
+
+    @pytest.mark.asyncio
+    async def test_image_send_follows_resolved_target(self, adapter, tmp_path):
+        img = tmp_path / "chart.png"
+        img.write_bytes(b"\x89PNG fake")
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "nested4", CHANNEL, content="@Chip chart please",
+                p=SELF_PUBKEY, reply_to="thread-root",
+            ),
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-img", "message": ""})
+        adapter._run_cli = cli
+        result = await adapter.send_image(CHANNEL, str(img), caption="here", reply_to="nested4")
+        assert result.success is True
+        args = cli.calls[0][0]
+        assert args[args.index("--reply-to") + 1] == "thread-root"
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 

@@ -68,6 +68,12 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # (Slack's default), and costs no extra API calls — the existing typing
     # refresh cadence just renders different text.
     "live_status": "full",
+    # Chat notification for background memory/skill review results
+    # ("💾 Memory updated" / "💾 Self-improvement review: …").
+    #   off     — no chat notification (still logged to stdout)
+    #   on      — generic summary (default)
+    #   verbose — include compact content previews
+    "memory_notifications": "on",
 }
 
 # ---------------------------------------------------------------------------
@@ -152,6 +158,15 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
+    # Buzz (Nostr relay, CLI-driven): no message editing, so every progress or
+    # status bubble is a permanent event in a shared channel. Keep the agent
+    # calm by default: no tool progress, no interim/heartbeat chatter, no
+    # steer/redirect confirmation bubbles, no self-improvement summaries.
+    "buzz":            {
+        **_TIER_LOW,
+        "busy_steer_ack_enabled": False,
+        "memory_notifications": "off",
+    },
     "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
     # WhatsApp Cloud API: Meta added message editing in 2023 but the
     # Hermes Cloud adapter doesn't implement edit_message yet, so we
@@ -281,6 +296,11 @@ def _normalise(setting: str, value: Any) -> Any:
                 return "generic"
             return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
+    if setting == "memory_notifications":
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        val = str(value).strip().lower()
+        return val if val in ("off", "on", "verbose") else "on"
     if setting == "cleanup_progress":
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}

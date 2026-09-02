@@ -422,6 +422,19 @@ class BuzzAdapter(BasePlatformAdapter):
         self._self_npub: str = ""
         self._display_name: str = ""
 
+        # Reply-target resolution state (threading rule, see
+        # _resolve_send_reply_target):
+        #   * _reply_targets maps a dispatched triggering event id to its
+        #     resolved reply target, so the gateway's reply anchor (which is
+        #     always the triggering message id) can be remapped at send time;
+        #   * _active_reply_target keeps the most recent resolved target per
+        #     conversation, so turn outputs that arrive with no reply context
+        #     at all (status notices, media sends, background summaries) land
+        #     in the same reply context as the triggering message instead of
+        #     at the channel root.
+        self._reply_targets: "OrderedDict[str, str]" = OrderedDict()
+        self._active_reply_target: Dict[str, str] = {}
+
         # Runtime state
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
@@ -597,9 +610,83 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
         self._poll_task = None
         self._channel_state = {}
+        self._reply_targets = OrderedDict()
+        self._active_reply_target = {}
         self._poll_count = 0
 
     # ── Sending ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _event_reply_parent(event: dict) -> Optional[str]:
+        """Return the event id this event replies to, or None for top-level.
+
+        Buzz reply chains use NIP-10 marked ``e`` tags: ``["e", <id>, <relay>,
+        "reply"]`` points at the immediate parent and ``["e", <id>, <relay>,
+        "root"]`` at the thread root (a first-level reply may carry only one of
+        them). Unmarked ``e`` tags fall back to NIP-10 positional semantics:
+        the LAST one is the parent.
+        """
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+        marked_reply = marked_root = None
+        unmarked: List[str] = []
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "e":
+                continue
+            event_id = str(tag[1] or "")
+            if not event_id:
+                continue
+            marker = str(tag[3]) if len(tag) > 3 else ""
+            if marker == "reply":
+                marked_reply = event_id
+            elif marker == "root":
+                marked_root = event_id
+            else:
+                unmarked.append(event_id)
+        return marked_reply or marked_root or (unmarked[-1] if unmarked else None)
+
+    def _record_reply_target(self, channel_id: str, event: dict) -> None:
+        """Resolve and remember where responses to ``event`` must be sent.
+
+        Threading rule (requested by the community owner): when the agent is
+        addressed in a TOP-LEVEL channel message, respond as a CHILD of that
+        message (starting a thread); when addressed in a message that is
+        itself a reply/thread item, respond as a SIBLING at the same level —
+        i.e. reply to that message's parent — so agent responses never nest
+        one level deeper with every exchange.
+        """
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            return
+        target = self._event_reply_parent(event) or event_id
+        self._reply_targets[event_id] = target
+        while len(self._reply_targets) > _SEEN_CAP:
+            self._reply_targets.popitem(last=False)
+        self._active_reply_target[str(channel_id)] = target
+
+    def _resolve_send_reply_target(
+        self,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> str:
+        """Resolve the outbound ``--reply-to`` target for a send.
+
+        The gateway's reply anchor is always the triggering message id; remap
+        it through ``_reply_targets`` so the sibling/child threading rule in
+        :meth:`_record_reply_target` is applied. Explicit targets that were
+        never dispatched (e.g. the send-message tool replying to an arbitrary
+        event) pass through unchanged. Sends with no reply context at all
+        (status notices, media attachments, background summaries) fall back to
+        the conversation's most recent resolved target so every output of a
+        turn lands in the same reply context instead of at the channel root.
+        """
+        for candidate in (reply_to, (metadata or {}).get("thread_id")):
+            if candidate:
+                candidate = str(candidate)
+                return self._reply_targets.get(candidate, candidate)
+        return self._active_reply_target.get(str(chat_id), "")
 
     async def send(
         self,
@@ -611,7 +698,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        reply_target = self._resolve_send_reply_target(chat_id, reply_to, metadata)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -683,7 +770,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            reply_target = reply_to or (metadata or {}).get("thread_id")
+            reply_target = self._resolve_send_reply_target(chat_id, reply_to, metadata)
             if reply_target:
                 args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
@@ -1064,6 +1151,11 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
+
+        # Resolve where every output responding to this event must be sent
+        # (sibling for nested triggers, child for top-level ones) BEFORE
+        # dispatching, so even sends racing the dispatch see the new target.
+        self._record_reply_target(channel_id, event)
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
         # /whoami) and clean prompts are recognized. DM messages often still

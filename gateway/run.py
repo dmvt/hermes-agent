@@ -5766,13 +5766,18 @@ class TurnRunner:
                 if _pdc is not None:
                     _pdc[ctx.session_key] = _release_bg_review_messages
         # Memory update notifications in chat.  Config: display.memory_notifications
+        # (overridable per platform via display.platforms.<platform>.memory_notifications)
         #   off     — no chat notification (still logged to stdout)
         #   on      — generic "💾 Memory updated" (default)
         #   verbose — content preview: "💾 Memory ➕ Hermes Repo..."
-        _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
-        if isinstance(_mem_notif, bool):
-            _mem_notif = "on" if _mem_notif else "off"
-        agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
+        from gateway.display_config import resolve_display_setting as _resolve_display
+
+        agent.memory_notifications = _resolve_display(
+            ctx.user_config,
+            _platform_config_key(ctx.source.platform),
+            "memory_notifications",
+            "on",
+        )
 
         # ------------------------------------------------------------------
         # Clarify callback: present a clarify prompt and block on a response.
@@ -10228,8 +10233,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # In steer mode the user's text has already been injected into the
         # active run. Some mobile chat setups want that steering to be silent,
         # like STT transcript echo suppression: keep the behavior, drop only
-        # the confirmation bubble.
-        if is_steer_mode:
+        # the confirmation bubble. A successful redirect is the same shape —
+        # the correction already landed inside the active run — so its
+        # "↪ Redirected current run" bubble honors the same setting.
+        if is_steer_mode or is_redirect_mode:
             steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
             if steer_ack_env is not None:
                 steer_ack_enabled = steer_ack_env.strip().lower() in {"1", "true", "yes", "on"}
