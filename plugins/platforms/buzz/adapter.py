@@ -43,6 +43,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -753,6 +754,165 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         return True
 
+    # ── Attachment upload (shared by send_image / send_image_file / send_document) ──
+    #
+    # Buzz's ``messages send --file <path>`` uploads the file to the relay
+    # and returns the emitted event.  We share one code path so images and
+    # documents cannot diverge on threading, retry, receipt verification, or
+    # terminal-error shaping.  Item triage fi_6fa8864e (Sept 2026):
+    #   1. Documents were falling through to the base fallback and surfacing
+    #      the generic "⚠️ Couldn't deliver the file attachment" warning
+    #      because ``send_document`` was not overridden here.
+    #   2. Every artifact must produce exactly ONE delivery attempt — retries
+    #      happen inside this helper (not by the dispatcher spawning two
+    #      lanes), and the dispatcher's own dedup keeps mixed image+file
+    #      lanes from double-posting the same path.
+    #   3. Receipt verification: the returned event must actually carry an
+    #      attachment marker before we report success (previously we trusted
+    #      ``data.accepted`` which defaults True for older CLI shapes).
+    #   4. On terminal failure we return ONE actionable error whose text
+    #      contains only the basename plus a correlation id — never the
+    #      runner-local filesystem path.
+
+    @staticmethod
+    def _new_correlation_id() -> str:
+        """Short opaque id for correlating a delivery attempt across logs."""
+        return uuid.uuid4().hex[:8]
+
+    @staticmethod
+    def _receipt_confirms_attachment(data: Any) -> bool:
+        """Whether the buzz CLI's send response confirms an attachment landed.
+
+        Buzz returns the emitted Nostr event under ``data.event`` (or a flat
+        ``attachments`` summary) on newer CLIs.  A confirmed attachment shows
+        up as an ``imeta``/``file``/``url`` tag on that event, or as a non-empty
+        ``attachments`` collection.  Older CLIs (and the standalone-send path)
+        only return ``accepted``/``event_id`` — we can't strictly verify a
+        receipt there, so we treat those as accepted (avoids false negatives
+        from stale CLIs installed on operator boxes) but log a debug notice.
+        """
+        if not isinstance(data, dict):
+            return False
+        if data.get("accepted") is False:
+            return False
+        event = data.get("event") if isinstance(data.get("event"), dict) else None
+        tags = []
+        if event is not None:
+            raw_tags = event.get("tags")
+            if isinstance(raw_tags, list):
+                tags = raw_tags
+        for tag in tags:
+            if isinstance(tag, (list, tuple)) and tag:
+                head = str(tag[0]).lower()
+                if head in ("imeta", "file", "attachment", "attachments", "url", "media"):
+                    return True
+        attachments = data.get("attachments")
+        if event is not None and not attachments:
+            attachments = event.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            return True
+        # Older CLI: no event object or attachments payload came back.  The
+        # dispatch would produce a false-negative user notice on every send —
+        # trust ``accepted`` when the CLI at least returned an event id.
+        if event is None and not attachments:
+            return bool(data.get("event_id"))
+        # Event returned but no attachment marker at all — receipt failed.
+        return False
+
+    async def _send_attachment(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        kind: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        max_attempts: int = 3,
+    ) -> SendResult:
+        """Upload ``file_path`` via ``messages send --file`` with bounded retry.
+
+        Preserves the thread/root/channel identifiers by re-using
+        :meth:`_resolve_send_reply_target` and confirms the destination event
+        carries an attachment marker before reporting success.  Terminal
+        errors carry a correlation id and only expose the basename — never the
+        runner-local path (which would leak the agent host's filesystem
+        layout into chat).
+        """
+        local = Path(file_path).expanduser()
+        display_name = file_name or local.name
+        corr = self._new_correlation_id()
+        if not local.is_file():
+            logger.error(
+                "Buzz[%s]: attachment %s is not readable (corr=%s)",
+                kind, local, corr,
+            )
+            return SendResult(
+                success=False,
+                error=f"Couldn't deliver the {kind} attachment ({display_name}) [id={corr}]",
+                retryable=False,
+            )
+
+        args = [
+            "messages", "send",
+            "--channel", str(chat_id),
+            "--file", str(local),
+            "--content", "-",
+        ]
+        reply_target = self._resolve_send_reply_target(chat_id, reply_to, metadata)
+        if reply_target:
+            args += ["--reply-to", str(reply_target)]
+
+        last_error = ""
+        for attempt in range(1, max_attempts + 1):
+            code, out, err = await self._run_cli(args, input_text=caption or "")
+            if code == 0:
+                try:
+                    data = json.loads(out or "{}")
+                except ValueError:
+                    data = {}
+                event_id = data.get("event_id")
+                if event_id:
+                    # Belt-and-braces echo suppression, mirroring send()/send_image.
+                    self._mark_seen(str(chat_id), str(event_id))
+                if self._receipt_confirms_attachment(data):
+                    return SendResult(
+                        success=True,
+                        message_id=str(event_id) if event_id else None,
+                        raw_response=data,
+                    )
+                # Message was posted but the relay's echo shows no attachment.
+                # Do NOT retry — retrying would create duplicate chat messages.
+                logger.warning(
+                    "Buzz[%s]: receipt did not confirm attachment for %s (corr=%s)",
+                    kind, display_name, corr,
+                )
+                return SendResult(
+                    success=False,
+                    error=f"Couldn't deliver the {kind} attachment ({display_name}) [id={corr}]",
+                    retryable=False,
+                    raw_response=data,
+                )
+            last_error = _cli_error_message(err, code)
+            logger.warning(
+                "Buzz[%s]: send attempt %d/%d failed for %s (corr=%s): %s",
+                kind, attempt, max_attempts, display_name, corr, last_error,
+            )
+            # Only retry on transient exits: 2 = retryable per CLI contract,
+            # 124 = our own timeout sentinel from _exec_buzz. Anything else is
+            # a hard/config error where a re-run would just fail identically.
+            if code not in (2, 124):
+                break
+            if attempt < max_attempts:
+                await asyncio.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
+
+        return SendResult(
+            success=False,
+            error=f"Couldn't deliver the {kind} attachment ({display_name}) [id={corr}]",
+            retryable=False,
+        )
+
     async def send_image(
         self,
         chat_id: str,
@@ -764,29 +924,13 @@ class BuzzAdapter(BasePlatformAdapter):
         """Send an image: local files upload via --file, URLs go as a link."""
         local = Path(image_url).expanduser() if not image_url.startswith(("http://", "https://")) else None
         if local is not None and local.is_file():
-            args = [
-                "messages", "send",
-                "--channel", str(chat_id),
-                "--file", str(local),
-                "--content", "-",
-            ]
-            reply_target = self._resolve_send_reply_target(chat_id, reply_to, metadata)
-            if reply_target:
-                args += ["--reply-to", str(reply_target)]
-            code, out, err = await self._run_cli(args, input_text=caption or "")
-            if code != 0:
-                return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
-            try:
-                data = json.loads(out or "{}")
-            except ValueError:
-                data = {}
-            event_id = data.get("event_id")
-            if event_id:
-                self._mark_seen(str(chat_id), str(event_id))
-            return SendResult(
-                success=bool(data.get("accepted", True)),
-                message_id=str(event_id) if event_id else None,
-                raw_response=data,
+            return await self._send_attachment(
+                chat_id=chat_id,
+                file_path=str(local),
+                kind="image",
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
             )
         # Markdown renders in Buzz, so a URL arrives as a clickable image link.
         text = f"{caption}\n{image_url}" if caption else image_url
@@ -802,10 +946,39 @@ class BuzzAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Upload a local image through Buzz's native file attachment path."""
-        return await self.send_image(
+        return await self._send_attachment(
             chat_id=chat_id,
-            image_url=image_path,
+            file_path=image_path,
+            kind="image",
             caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a document/file through Buzz's native ``--file`` upload path.
+
+        Without this override, the dispatcher's document routing
+        (``gateway/platforms/base.py`` extension partition) hit the base
+        fallback and surfaced the generic "⚠️ Couldn't deliver the file
+        attachment" warning even when Buzz was perfectly capable of
+        delivering it via ``messages send --file`` (triage fi_6fa8864e).
+        """
+        return await self._send_attachment(
+            chat_id=chat_id,
+            file_path=file_path,
+            kind="file",
+            caption=caption,
+            file_name=file_name,
             reply_to=reply_to,
             metadata=metadata,
         )

@@ -590,6 +590,235 @@ class TestBuzzAdapterSend:
         assert stdin_text == "generated image"
 
 
+# ── Attachment upload: send_document + shared attachment path ─────────────
+#
+# Triage fi_6fa8864e (2026-09-03):
+#   * ``send_document`` must upload via the same ``messages send --file``
+#     path as ``send_image`` so document-routed artifacts stop falling back
+#     to the generic file-attachment warning.
+#   * A single artifact must produce a single delivery attempt: bounded
+#     retry lives INSIDE the adapter (transient exits only), never as
+#     duplicate CLI invocations after a message actually posted.
+#   * Success requires the returned event to carry an attachment marker —
+#     ``accepted=True`` alone is insufficient (was the previous behavior
+#     that produced silent drops).
+#   * Terminal errors expose only the basename plus a correlation id.
+
+
+def _attachment_confirmed_payload(event_id="evt-attach"):
+    """A ``buzz messages send`` response the receipt-verifier confirms."""
+    return {
+        "accepted": True,
+        "event_id": event_id,
+        "event": {
+            "id": event_id,
+            "tags": [
+                ["h", CHANNEL],
+                ["imeta", f"url https://relay.example/{event_id}.bin"],
+            ],
+        },
+    }
+
+
+def _attachment_missing_payload(event_id="evt-nofile"):
+    """A ``messages send`` response with no attachment marker on the event."""
+    return {
+        "accepted": True,
+        "event_id": event_id,
+        "event": {"id": event_id, "tags": [["h", CHANNEL]]},
+    }
+
+
+class TestBuzzSendDocument:
+
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_via_file_flag(self, tmp_path):
+        pdf = tmp_path / "report.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", _attachment_confirmed_payload("evt-doc"))
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(pdf), caption="see attached")
+        assert result.success is True
+        assert result.message_id == "evt-doc"
+        args, stdin_text = cli.calls[0]
+        assert args[:2] == ["messages", "send"]
+        assert args[args.index("--channel") + 1] == CHANNEL
+        assert args[args.index("--file") + 1] == str(pdf)
+        assert args[args.index("--content") + 1] == "-"
+        assert stdin_text == "see attached"
+
+    @pytest.mark.asyncio
+    async def test_send_document_preserves_thread_reply_target(self, tmp_path):
+        """metadata.thread_id / reply_to must translate to --reply-to and
+        obey the sibling/child threading remap."""
+        pdf = tmp_path / "notes.pdf"
+        pdf.write_bytes(b"%PDF")
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        # Simulate a prior nested mention whose parent is thread-root.
+        adapter._reply_targets["evt-in"] = "thread-root"
+        cli = _ScriptedCli()
+        cli.script("messages", "send", _attachment_confirmed_payload("evt-doc-thread"))
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(
+            CHANNEL, str(pdf),
+            reply_to="evt-in",
+            metadata={"thread_id": "evt-in"},
+        )
+        assert result.success is True
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_send_document_missing_file_terminal_hides_runner_path(self, tmp_path):
+        missing = tmp_path / "no-such.pdf"
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(missing))
+        assert result.success is False
+        assert result.retryable is False
+        assert "no-such.pdf" in (result.error or "")
+        assert "[id=" in (result.error or "")
+        # Runner-local parent directory must not leak into the error text.
+        assert str(missing.parent) not in (result.error or "")
+        # No CLI invocation was attempted.
+        assert cli.calls == []
+
+    @pytest.mark.asyncio
+    async def test_send_document_retries_transient_exit_then_succeeds(self, tmp_path, monkeypatch):
+        pdf = tmp_path / "chart.pdf"
+        pdf.write_bytes(b"%PDF")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        # First call: retryable relay error (exit 2). Second call: success
+        # with a confirmed attachment marker.
+        cli.script(
+            "messages", "send", "",
+            code=2, stderr='{"error":"relay_error","message":"boom"}',
+        )
+        cli.script("messages", "send", _attachment_confirmed_payload("evt-doc2"))
+        adapter._run_cli = cli
+        # Skip the retry backoff so the test doesn't sleep in CI.
+        async def _no_sleep(_delay):
+            return None
+        monkeypatch.setattr(_buzz_mod.asyncio, "sleep", _no_sleep)
+
+        result = await adapter.send_document(CHANNEL, str(pdf))
+        assert result.success is True
+        assert result.message_id == "evt-doc2"
+        assert len(cli.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_send_document_hard_exit_produces_single_terminal_error(self, tmp_path):
+        pdf = tmp_path / "big.pdf"
+        pdf.write_bytes(b"%PDF")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages", "send", "",
+            code=1, stderr='{"error":"invalid_arg","message":"file too large"}',
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(pdf))
+        assert result.success is False
+        assert "big.pdf" in (result.error or "")
+        assert "[id=" in (result.error or "")
+        # No spinning on non-retryable exits.
+        assert len(cli.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_send_document_receipt_missing_attachment_marker_fails(self, tmp_path):
+        """The CLI accepted the send but the emitted event carries no
+        attachment marker — report failure and do NOT retry (would
+        duplicate the posted message)."""
+        pdf = tmp_path / "spec.pdf"
+        pdf.write_bytes(b"%PDF")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", _attachment_missing_payload("evt-doc-ghost"))
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(pdf))
+        assert result.success is False
+        assert "spec.pdf" in (result.error or "")
+        assert "[id=" in (result.error or "")
+        assert len(cli.calls) == 1
+
+
+class TestBuzzSendAttachmentReceiptVerification:
+
+    @pytest.mark.asyncio
+    async def test_send_image_local_confirms_attachment_marker(self, tmp_path):
+        img = tmp_path / "graph.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", _attachment_confirmed_payload("evt-img"))
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(CHANNEL, str(img), caption="chart")
+        assert result.success is True
+        assert result.message_id == "evt-img"
+
+    @pytest.mark.asyncio
+    async def test_send_image_receipt_missing_attachment_marker_fails(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", _attachment_missing_payload("evt-img-ghost"))
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(CHANNEL, str(img))
+        assert result.success is False
+        assert "shot.png" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_send_image_legacy_cli_shape_still_succeeds(self, tmp_path):
+        """Older buzz CLIs return only ``accepted``/``event_id`` (no event
+        object).  Trust the CLI to avoid false-negative user notices."""
+        img = tmp_path / "legacy.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-legacy", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(CHANNEL, str(img))
+        assert result.success is True
+        assert result.message_id == "evt-legacy"
+
+    def test_receipt_confirms_recognizes_common_attachment_tags(self):
+        conf = BuzzAdapter._receipt_confirms_attachment
+        for tag_head in ("imeta", "file", "attachment", "attachments", "url", "media"):
+            payload = {
+                "accepted": True,
+                "event_id": "e",
+                "event": {"tags": [["h", CHANNEL], [tag_head, "value"]]},
+            }
+            assert conf(payload), f"expected {tag_head!r} tag to confirm attachment"
+
+    def test_receipt_confirms_accepts_flat_attachments_list(self):
+        payload = {
+            "accepted": True,
+            "event_id": "e",
+            "event": {"tags": [["h", CHANNEL]]},
+            "attachments": [{"url": "https://relay.example/x.pdf"}],
+        }
+        assert BuzzAdapter._receipt_confirms_attachment(payload) is True
+
+    def test_receipt_confirms_rejects_explicit_not_accepted(self):
+        payload = {"accepted": False, "event_id": "e"}
+        assert BuzzAdapter._receipt_confirms_attachment(payload) is False
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
 

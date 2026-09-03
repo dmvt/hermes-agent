@@ -6614,7 +6614,37 @@ class BasePlatformAdapter(ABC):
                 # files skip the photo path and route to send_document below
                 # so they're delivered with original bytes (no Telegram
                 # sendPhoto recompression).
+                #
+                # Single-attempt semantics (triage fi_6fa8864e): the same
+                # artifact must not surface in more than one downstream lane.
+                # extract_media strips MEDIA: from the text before
+                # extract_local_files runs, so the common overlap is
+                # defensive; still, dedupe by resolved absolute path so a
+                # dual-mentioned file cannot produce independent file+image
+                # attempts with duplicate failure notices.
                 from urllib.parse import quote as _quote
+
+                def _dedupe_key(path_str: str) -> str:
+                    try:
+                        return str(Path(path_str).expanduser().resolve(strict=False))
+                    except (OSError, RuntimeError):
+                        return str(path_str)
+
+                _seen_delivery_paths: set = set()
+
+                def _claim_delivery_path(path_str: str) -> bool:
+                    key = _dedupe_key(path_str)
+                    if key in _seen_delivery_paths:
+                        logger.info(
+                            "[%s] Skipping duplicate delivery of %s "
+                            "(already dispatched in this turn).",
+                            self.name,
+                            os.path.basename(path_str),
+                        )
+                        return False
+                    _seen_delivery_paths.add(key)
+                    return True
+
                 _image_paths: list = []
                 _non_image_media: list = []
                 for media_path, is_voice in media_files:
@@ -6622,16 +6652,20 @@ class BasePlatformAdapter(ABC):
                     if (_ext in _IMAGE_EXTS
                             and not is_voice
                             and not force_document_attachments):
-                        _image_paths.append(media_path)
+                        if _claim_delivery_path(media_path):
+                            _image_paths.append(media_path)
                     else:
-                        _non_image_media.append((media_path, is_voice))
+                        if _claim_delivery_path(media_path):
+                            _non_image_media.append((media_path, is_voice))
                 _non_image_local: list = []
                 for file_path in local_files:
                     if (Path(file_path).suffix.lower() in _IMAGE_EXTS
                             and not force_document_attachments):
-                        _image_paths.append(file_path)
+                        if _claim_delivery_path(file_path):
+                            _image_paths.append(file_path)
                     else:
-                        _non_image_local.append(file_path)
+                        if _claim_delivery_path(file_path):
+                            _non_image_local.append(file_path)
 
                 if _image_paths:
                     try:

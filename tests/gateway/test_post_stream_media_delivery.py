@@ -111,3 +111,32 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
+@pytest.mark.asyncio
+async def test_document_media_tag_post_stream_routes_to_send_document_with_thread(
+    tmp_path, monkeypatch,
+):
+    """A document MEDIA: tag from a threaded event must route to
+    ``send_document`` with the thread metadata preserved (triage
+    fi_6fa8864e — document artifacts must land as native attachments
+    on the same reply topic, not fall through to a generic warning)."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter = _adapter()
+    thread_meta = {"thread_id": "topic-7"}
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(thread_meta),
+        f"Here is the report.\nMEDIA:{media_file}",
+        _event(),
+        adapter,
+        thread_metadata=thread_meta,
+    )
+
+    adapter.send_document.assert_awaited_once()
+    doc_kwargs = adapter.send_document.await_args.kwargs
+    assert doc_kwargs["chat_id"] == "C123CHAN"
+    assert doc_kwargs["file_path"] == str(media_file)
+    assert doc_kwargs["metadata"] == thread_meta
+    adapter.send_multiple_images.assert_not_awaited()
+    adapter.send_image_file.assert_not_awaited()
+
+
