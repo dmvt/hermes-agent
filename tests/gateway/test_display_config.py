@@ -478,11 +478,10 @@ class TestBuzzWorkingIndicatorPublisher:
         from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
         buzz_mod = load_plugin_adapter("buzz")
-        from gateway.config import PlatformConfig, Platform
+        from gateway.config import PlatformConfig
 
         adapter = buzz_mod.BuzzAdapter(
-            PlatformConfig(enabled=True, token="***"),
-            Platform("buzz"),
+            PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay"}),
         )
         return adapter
 
