@@ -57,14 +57,17 @@ def _clean_env(monkeypatch, tmp_path):
     yield
 
 
-def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind=9):
+def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind=9, p=None):
+    tags = [["h", CHANNEL]]
+    if p:
+        tags.append(["p", p])
     return {
         "id": event_id,
         "pubkey": pubkey,
         "content": content,
         "created_at": created_at,
         "kind": kind,
-        "tags": [["h", CHANNEL]],
+        "tags": tags,
     }
 
 
@@ -189,15 +192,15 @@ class TestPollingDedupe:
     @pytest.mark.asyncio
     async def test_new_event_dispatched_once(self, adapter):
         cli = _ScriptedCli()
-        cli.script("messages", "get", [_event("e1", content="@Chip hi", created_at=100)])
+        cli.script("messages", "get", [_event("e1", content="@Chip hi", created_at=100, p=SELF_PUBKEY)])
         adapter._run_cli = cli
         await adapter._seed_channel(CHANNEL, chat_type="group")
 
         # Poll 1: seeded event + a genuinely new mention
         cli.responses.clear()
         cli.script("messages", "get", [
-            _event("e1", content="@Chip hi", created_at=100),
-            _event("e2", content="hey @Chip, ping", created_at=150),
+            _event("e1", content="@Chip hi", created_at=100, p=SELF_PUBKEY),
+            _event("e2", content="hey @Chip, ping", created_at=150, p=SELF_PUBKEY),
         ])
         await adapter._poll_channel(CHANNEL)
         assert [d["message_id"] for d in adapter._dispatched] == ["e2"]
@@ -239,8 +242,13 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
-    async def test_name_mention_dispatched(self, adapter):
+    async def test_name_mention_requires_structural_p_tag(self, adapter):
+        # Structural gating (fix/buzz require structural p-tag mentions): a
+        # display-name @mention with no ["p", self] tag must NOT dispatch...
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
+        assert adapter._dispatched == []
+        # ...while the same message carrying the structural tag dispatches.
+        await self._poll_with(adapter, _event("e2", content="hey @Chip can you help?", created_at=20, p=SELF_PUBKEY))
         assert len(adapter._dispatched) == 1
 
 
@@ -356,7 +364,10 @@ class TestDmClassification:
             _tagged_event("e1", CHANNEL, content="fyi everyone", p=SELF_PUBKEY),
         )
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
-        assert adapter._dispatched == []
+        # Under structural gating a ["p", self] tag IS a mention, so the
+        # message dispatches — but as a group message: the guard's point is
+        # that channel-like metadata still blocks the DM latch.
+        assert all(d["chat_type"] == "group" for d in adapter._dispatched)
 
 
     @pytest.mark.asyncio

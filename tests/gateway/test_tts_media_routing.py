@@ -114,7 +114,8 @@ async def test_base_adapter_routes_document_media_tag_to_send_document_with_thre
     # And the media path must not have leaked into the visible text.
     text_call = adapter.send.await_args
     assert text_call is not None
-    assert str(doc) not in text_call.args[1]
+    sent_text = text_call.args[1] if len(text_call.args) > 1 else text_call.kwargs.get("content", "")
+    assert str(doc) not in sent_text
 
 
 @pytest.mark.asyncio
