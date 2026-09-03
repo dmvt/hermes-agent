@@ -2013,13 +2013,48 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 
 
-def _current_max_iterations() -> int:
-    """Return the current per-turn iteration budget after runtime env refresh."""
+def _current_max_iterations(
+    *,
+    profile_name: Optional[str] = None,
+    user_config: Optional[dict] = None,
+) -> int:
+    """Return the current per-turn iteration budget after runtime env refresh.
+
+    fi_b6ce3936 — when ``profile_name`` names an image-producing profile
+    (``runyard-image-director`` by default; extend via
+    ``HERMES_IMAGE_GENERATION_PROFILES``), the returned budget is intersected
+    with the smaller image-generation budget so an "Image Director" turn
+    cannot silently inherit the global 500-turn ``HERMES_MAX_ITERATIONS``.
+    Callers that pass no ``profile_name`` still get the legacy global cap;
+    the site that actually kicks off an image-producing turn is expected to
+    resolve the active profile name and pass it in.
+    """
     _reload_runtime_env_preserving_config_authority()
     try:
-        return int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
+        global_max = int(os.getenv("HERMES_MAX_ITERATIONS", "500"))
     except (TypeError, ValueError):
-        return 500
+        global_max = 500
+
+    resolved_profile = profile_name
+    if resolved_profile is None:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            resolved_profile = get_active_profile_name() or "default"
+        except Exception:
+            resolved_profile = None
+
+    try:
+        from gateway.image_generation import (
+            image_generation_budget,
+            is_image_generation_profile,
+        )
+        if is_image_generation_profile(resolved_profile):
+            budget = image_generation_budget(user_config)
+            return budget.clamp_iterations(global_max)
+    except Exception:  # noqa: BLE001 — never let budget resolution break a turn
+        pass
+
+    return global_max
 
 
 from contextlib import contextmanager as _contextmanager
@@ -5220,7 +5255,17 @@ class TurnRunner:
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
-        max_iterations = _current_max_iterations()
+        # fi_b6ce3936 — pass the active profile so image-producing profiles
+        # (e.g. runyard-image-director) get the small image-generation cap,
+        # not the global HERMES_MAX_ITERATIONS default of 500.
+        try:
+            _profile_for_budget = self._runner._active_profile_name()
+        except Exception:
+            _profile_for_budget = None
+        max_iterations = _current_max_iterations(
+            profile_name=_profile_for_budget,
+            user_config=ctx.user_config,
+        )
 
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
@@ -12280,6 +12325,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "or HERMES_MAX_ITERATIONS from .env, or default 500)",
                 _effective_max_iter,
             )
+            # fi_b6ce3936 — image-producing profiles use a smaller cap so a
+            # runaway turn cannot burn through the global default. Log the
+            # actual clamped ceiling for the active profile so operators can
+            # verify the image budget at gateway startup.
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                from gateway.image_generation import (
+                    image_generation_budget,
+                    is_image_generation_profile,
+                )
+                _profile_for_budget = get_active_profile_name() or "default"
+                if is_image_generation_profile(_profile_for_budget):
+                    _img_budget = image_generation_budget(None)
+                    logger.info(
+                        "Image-generation budget: max_iterations=%d wall_clock=%ss "
+                        "(profile=%s; clamped effective cap=%d)",
+                        _img_budget.max_iterations,
+                        _img_budget.wall_clock_seconds,
+                        _profile_for_budget,
+                        _img_budget.clamp_iterations(_effective_max_iter),
+                    )
+            except Exception:
+                pass
         except Exception:
             pass
         # Redaction status: ON by default (#17691). Surface a prominent
@@ -22204,7 +22272,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets = parse_config_string_list(agent_cfg.get("disabled_toolsets")) or None
 
             pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            # fi_b6ce3936 — image-producing profiles must inherit the small
+            # image-generation cap here too; background/task-driven turns are
+            # a common way to end up "iteration 8/500" without an artifact.
+            try:
+                _bg_profile_for_budget = self._active_profile_name()
+            except Exception:
+                _bg_profile_for_budget = None
+            max_iterations = _current_max_iterations(
+                profile_name=_bg_profile_for_budget,
+                user_config=user_config,
+            )
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source, model=model
             )
