@@ -618,14 +618,20 @@ class BuzzAdapter(BasePlatformAdapter):
     # ── Sending ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _event_reply_parent(event: dict) -> Optional[str]:
-        """Return the event id this event replies to, or None for top-level.
+    def _event_thread_root(event: dict) -> Optional[str]:
+        """Return the id of the thread root this event belongs to, or None
+        for a top-level message.
 
         Buzz reply chains use NIP-10 marked ``e`` tags: ``["e", <id>, <relay>,
-        "reply"]`` points at the immediate parent and ``["e", <id>, <relay>,
-        "root"]`` at the thread root (a first-level reply may carry only one of
-        them). Unmarked ``e`` tags fall back to NIP-10 positional semantics:
-        the LAST one is the parent.
+        "root"]`` names the thread root and ``["e", <id>, <relay>, "reply"]``
+        the immediate parent (a first-level reply may carry only one of them,
+        in which case that single tag IS the root). Unmarked ``e`` tags fall
+        back to NIP-10 positional semantics: the FIRST one is the root. A
+        lone "reply" marker with no root is treated as the best-known root —
+        for a first-level reply the parent is the root, and anchoring any
+        deeper stray shape to its parent still keeps the response inside the
+        thread rather than at the channel root (the documented safe
+        fallback for missing/invalid threading metadata).
         """
         tags = event.get("tags")
         if not isinstance(tags, list):
@@ -645,22 +651,23 @@ class BuzzAdapter(BasePlatformAdapter):
                 marked_root = event_id
             else:
                 unmarked.append(event_id)
-        return marked_reply or marked_root or (unmarked[-1] if unmarked else None)
+        return marked_root or (unmarked[0] if unmarked else None) or marked_reply
 
     def _record_reply_target(self, channel_id: str, event: dict) -> None:
         """Resolve and remember where responses to ``event`` must be sent.
 
-        Threading rule (requested by the community owner): when the agent is
-        addressed in a TOP-LEVEL channel message, respond as a CHILD of that
-        message (starting a thread); when addressed in a message that is
-        itself a reply/thread item, respond as a SIBLING at the same level —
-        i.e. reply to that message's parent — so agent responses never nest
-        one level deeper with every exchange.
+        Slack-style bounded threading: when the agent is addressed in a
+        TOP-LEVEL channel message, respond as a CHILD of that message (the
+        message becomes the thread root); when addressed in a message that is
+        already inside a thread, respond as a child of that thread's STABLE
+        ROOT. Every response therefore sits exactly one level below a root —
+        never a reply to a reply — and repeated exchanges keep anchoring to
+        the same root instead of the previous reply.
         """
         event_id = str(event.get("id") or "")
         if not event_id:
             return
-        target = self._event_reply_parent(event) or event_id
+        target = self._event_thread_root(event) or event_id
         self._reply_targets[event_id] = target
         while len(self._reply_targets) > _SEEN_CAP:
             self._reply_targets.popitem(last=False)
@@ -675,7 +682,7 @@ class BuzzAdapter(BasePlatformAdapter):
         """Resolve the outbound ``--reply-to`` target for a send.
 
         The gateway's reply anchor is always the triggering message id; remap
-        it through ``_reply_targets`` so the sibling/child threading rule in
+        it through ``_reply_targets`` so the bounded root-anchoring rule in
         :meth:`_record_reply_target` is applied. Explicit targets that were
         never dispatched (e.g. the send-message tool replying to an arbitrary
         event) pass through unchanged. Sends with no reply context at all
@@ -1406,8 +1413,9 @@ class BuzzAdapter(BasePlatformAdapter):
             return
 
         # Resolve where every output responding to this event must be sent
-        # (sibling for nested triggers, child for top-level ones) BEFORE
-        # dispatching, so even sends racing the dispatch see the new target.
+        # (the stable thread root for nested triggers, the message itself for
+        # top-level ones) BEFORE dispatching, so even sends racing the
+        # dispatch see the new target.
         self._record_reply_target(channel_id, event)
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->

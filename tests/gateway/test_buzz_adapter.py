@@ -442,16 +442,21 @@ class TestReplyTargetResolution:
     def _reply_to_arg(args):
         return args[args.index("--reply-to") + 1] if "--reply-to" in args else None
 
-    def test_event_reply_parent_shapes(self):
-        parent = BuzzAdapter._event_reply_parent
+    def test_event_thread_root_shapes(self):
+        root = BuzzAdapter._event_thread_root
         # Top-level: no e tags at all.
-        assert parent({"tags": [["h", CHANNEL]]}) is None
-        # Marked reply wins over marked root.
-        assert parent({"tags": [["e", "root1", "", "root"], ["e", "mid1", "", "reply"]]}) == "mid1"
+        assert root({"tags": [["h", CHANNEL]]}) is None
+        # Marked root wins over marked reply (deep nested reply).
+        assert root({"tags": [["e", "root1", "", "root"], ["e", "mid1", "", "reply"]]}) == "root1"
         # Root-only marking (first-level thread reply).
-        assert parent({"tags": [["e", "root1", "", "root"]]}) == "root1"
-        # Unmarked legacy tags: positional NIP-10 — last one is the parent.
-        assert parent({"tags": [["e", "root1"], ["e", "mid1"]]}) == "mid1"
+        assert root({"tags": [["e", "root1", "", "root"]]}) == "root1"
+        # Unmarked legacy tags: positional NIP-10 — FIRST one is the root.
+        assert root({"tags": [["e", "root1"], ["e", "mid1"]]}) == "root1"
+        # Lone reply marker (first-level reply): the parent IS the root.
+        assert root({"tags": [["e", "root1", "", "reply"]]}) == "root1"
+        # Invalid tag shapes are ignored, not fatal (safe fallback).
+        assert root({"tags": "garbage"}) is None
+        assert root({"tags": [["e"], ["e", ""]]}) is None
 
     @pytest.mark.asyncio
     async def test_top_level_mention_replies_as_child(self, adapter):
@@ -466,8 +471,9 @@ class TestReplyTargetResolution:
         assert self._reply_to_arg(args) == "top1"
 
     @pytest.mark.asyncio
-    async def test_nested_mention_replies_as_sibling(self, adapter):
-        """Tagged in a thread reply: the response targets that reply's parent."""
+    async def test_nested_mention_replies_to_thread_root(self, adapter):
+        """Tagged in a first-level thread reply: the response anchors to the
+        thread root, keeping the thread flat."""
         await self._poll_with(
             adapter,
             _tagged_event(
@@ -478,6 +484,57 @@ class TestReplyTargetResolution:
         assert [d["message_id"] for d in adapter._dispatched] == ["nested1"]
         args = await self._send(adapter, reply_to="nested1")
         assert self._reply_to_arg(args) == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_deep_nested_mention_anchors_to_marked_root(self, adapter):
+        """Tagged deep in a thread (root + reply markers): the response
+        anchors to the STABLE ROOT, not the immediate parent — never a
+        reply to a reply."""
+        deep = _tagged_event(
+            "deep1", CHANNEL, content="@Chip deeper?", p=SELF_PUBKEY,
+        )
+        deep["tags"].insert(1, ["e", "thread-root", "", "root"])
+        deep["tags"].insert(2, ["e", "mid-reply", "", "reply"])
+        await self._poll_with(adapter, deep)
+        args = await self._send(adapter, reply_to="deep1")
+        assert self._reply_to_arg(args) == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_conversation_keeps_anchoring_to_same_root(self, adapter):
+        """Subsequent exchanges in a rooted conversation keep anchoring to
+        the original root rather than the previous reply."""
+        await self._poll_with(
+            adapter,
+            _tagged_event("top-a", CHANNEL, content="@Chip start", p=SELF_PUBKEY),
+        )
+        args = await self._send(adapter, reply_to="top-a")
+        assert self._reply_to_arg(args) == "top-a"
+        follow = _tagged_event(
+            "follow1", CHANNEL, content="@Chip more", p=SELF_PUBKEY, created_at=1001,
+        )
+        follow["tags"].insert(1, ["e", "top-a", "", "root"])
+        follow["tags"].insert(2, ["e", "evt-out", "", "reply"])
+        await self._poll_with(adapter, follow)
+        args = await self._send(adapter, reply_to="follow1")
+        assert self._reply_to_arg(args) == "top-a"
+
+    @pytest.mark.asyncio
+    async def test_websocket_and_poll_paths_share_root_anchoring(self, adapter):
+        """The WebSocket loop routes events through the same _handle_event()
+        as the poll loop; anchoring recorded there applies to both."""
+        async def stub_cli(args, input_text=None, **kwargs):
+            return 0, "{}", ""
+
+        adapter._run_cli = stub_cli
+        state = adapter._channel_state[CHANNEL]
+        nested = _tagged_event(
+            "ws-nested", CHANNEL, content="@Chip via ws", p=SELF_PUBKEY,
+        )
+        nested["tags"].insert(1, ["e", "ws-root", "", "root"])
+        nested["tags"].insert(2, ["e", "ws-mid", "", "reply"])
+        await adapter._handle_event(CHANNEL, state, nested)
+        assert adapter._active_reply_target[CHANNEL] == "ws-root"
+        assert adapter._reply_targets["ws-nested"] == "ws-root"
 
     @pytest.mark.asyncio
     async def test_contextless_send_follows_triggering_message(self, adapter):
