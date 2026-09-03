@@ -728,6 +728,86 @@ class BuzzAdapter(BasePlatformAdapter):
         """Buzz has no typing indicator API — no-op."""
         pass
 
+    # ── Working-indicator publisher (fi_a18c64a3 / fi_1a5a623902abd8558f9b) ──
+    #
+    # Buzz is a permanent-write Nostr relay: every ``messages send`` becomes
+    # a durable channel event visible to every subscriber. That makes
+    # ``tool_telemetry`` (progress bubbles, "⏳ Working — N min" heartbeats,
+    # status callbacks) unusable as chat messages — they would clutter the
+    # channel with agent-internal detail no participant asked for.
+    #
+    # Instead we maintain an in-memory "agent busy" state keyed by chat_id.
+    # A local composer surface (buzz-web mirror, and any future embedded UI)
+    # can poll ``get_working_indicator(chat_id)`` to render a transient
+    # "…is working" hint next to the input, without any of that state ever
+    # touching the wire. ``publish_working_indicator`` accepts an optional
+    # ``text`` payload so richer surfaces can show the current tool verb;
+    # ``clear_working_indicator`` MUST be called at turn end so a stale
+    # busy hint never outlives its run (fi_1a5a623902abd8558f9b folded in
+    # from the buzz-web mirror).
+
+    def publish_working_indicator(
+        self,
+        chat_id: str,
+        text: Optional[str] = None,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish an ephemeral 'agent busy' state for ``chat_id``.
+
+        Local composer surfaces read this via :meth:`get_working_indicator`.
+        Nothing is sent to the relay — callers pass tool telemetry through
+        this method precisely so it never becomes a durable chat message.
+        """
+        if not chat_id:
+            return
+        state = getattr(self, "_working_indicators", None)
+        if state is None:
+            state = {}
+            self._working_indicators = state
+        entry: Dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "busy": True,
+            "text": (text or "").strip() or None,
+            "ts": time.time(),
+        }
+        if metadata:
+            # Metadata is opaque to the adapter — pass through so a caller
+            # can attach thread routing info that the composer might render.
+            try:
+                entry["metadata"] = dict(metadata)
+            except Exception:
+                pass
+        state[str(chat_id)] = entry
+
+    def clear_working_indicator(self, chat_id: str) -> None:
+        """Clear the ephemeral 'agent busy' state for ``chat_id``.
+
+        Called at turn end (both success and interrupt paths) so the
+        composer area stops showing a stale busy hint.
+        """
+        if not chat_id:
+            return
+        state = getattr(self, "_working_indicators", None)
+        if not state:
+            return
+        state.pop(str(chat_id), None)
+
+    def get_working_indicator(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        """Return the current busy state for ``chat_id`` or ``None``.
+
+        Composer surfaces render the returned dict (keys: ``busy``,
+        ``text``, ``ts``, optional ``metadata``). None means the agent is
+        idle for that chat.
+        """
+        if not chat_id:
+            return None
+        state = getattr(self, "_working_indicators", None)
+        if not state:
+            return None
+        entry = state.get(str(chat_id))
+        return dict(entry) if entry else None
+
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
 

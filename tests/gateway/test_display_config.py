@@ -302,3 +302,216 @@ class TestLiveStatusSetting:
         assert resolve_display_setting({}, "slack", "live_status") == "full"
 
 
+# ---------------------------------------------------------------------------
+# Event classes + per-platform delivery policy (fi_a18c64a3)
+# ---------------------------------------------------------------------------
+
+class TestEventDeliveryPolicyBuzz:
+    """Buzz — permanent-write Nostr relay — must route each event class to
+    the surface that fits it. Tool telemetry never becomes a durable chat
+    message; agent activity never spams a channel; lifecycle warnings go to
+    the operator surface; only milestones and terminal results reach chat."""
+
+    def test_buzz_tool_telemetry_routes_to_ephemeral(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_TOOL_TELEMETRY,
+            DELIVERY_EPHEMERAL,
+        )
+
+        assert (
+            resolve_event_delivery({}, "buzz", EVENT_TOOL_TELEMETRY)
+            == DELIVERY_EPHEMERAL
+        )
+
+    def test_buzz_milestone_stays_in_chat(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_MILESTONE,
+            DELIVERY_CHAT,
+        )
+
+        assert (
+            resolve_event_delivery({}, "buzz", EVENT_MILESTONE) == DELIVERY_CHAT
+        )
+
+    def test_buzz_terminal_result_stays_in_chat(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_TERMINAL_RESULT,
+            DELIVERY_CHAT,
+        )
+
+        assert (
+            resolve_event_delivery({}, "buzz", EVENT_TERMINAL_RESULT)
+            == DELIVERY_CHAT
+        )
+
+    def test_buzz_agent_activity_routes_to_audit(self):
+        """Self-improvement / memory-updated / bg-review notices must NOT
+        surface as unsolicited channel messages on Buzz."""
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_AGENT_ACTIVITY,
+            DELIVERY_AUDIT,
+        )
+
+        assert (
+            resolve_event_delivery({}, "buzz", EVENT_AGENT_ACTIVITY)
+            == DELIVERY_AUDIT
+        )
+
+    def test_buzz_lifecycle_routes_to_operator(self):
+        """Gateway-shutting-down interrupt hints go to the operator surface
+        on Buzz, not to the user's channel as an agent message."""
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_LIFECYCLE,
+            DELIVERY_OPERATOR,
+        )
+
+        assert (
+            resolve_event_delivery({}, "buzz", EVENT_LIFECYCLE)
+            == DELIVERY_OPERATOR
+        )
+
+
+class TestEventDeliveryPolicyDefaults:
+    """Every event class defaults to durable ``chat`` on platforms with no
+    per-platform delivery policy override — preserves legacy behaviour."""
+
+    def test_defaults_are_chat_for_legacy_platforms(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_TOOL_TELEMETRY,
+            EVENT_MILESTONE,
+            EVENT_TERMINAL_RESULT,
+            EVENT_AGENT_ACTIVITY,
+            EVENT_LIFECYCLE,
+            DELIVERY_CHAT,
+        )
+
+        for plat in ("telegram", "discord", "slack", "matrix", "signal"):
+            for cls in (
+                EVENT_TOOL_TELEMETRY,
+                EVENT_MILESTONE,
+                EVENT_TERMINAL_RESULT,
+                EVENT_AGENT_ACTIVITY,
+                EVENT_LIFECYCLE,
+            ):
+                assert (
+                    resolve_event_delivery({}, plat, cls) == DELIVERY_CHAT
+                ), f"{plat}/{cls}"
+
+
+class TestEventDeliveryPolicyOverrides:
+    """Per-platform and global user overrides win over the built-in defaults."""
+
+    def test_platform_override_beats_builtin_default(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_TOOL_TELEMETRY,
+            DELIVERY_CHAT,
+        )
+
+        config = {
+            "display": {
+                "platforms": {
+                    "buzz": {
+                        "event_delivery": {
+                            "tool_telemetry": "chat",
+                        }
+                    }
+                }
+            }
+        }
+        assert (
+            resolve_event_delivery(config, "buzz", EVENT_TOOL_TELEMETRY)
+            == DELIVERY_CHAT
+        )
+
+    def test_global_override_applies_when_no_platform_override(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_LIFECYCLE,
+            DELIVERY_AUDIT,
+        )
+
+        config = {"display": {"event_delivery": {"lifecycle": "audit"}}}
+        assert (
+            resolve_event_delivery(config, "telegram", EVENT_LIFECYCLE)
+            == DELIVERY_AUDIT
+        )
+
+    def test_yaml_bool_false_normalises_to_off(self):
+        from gateway.display_config import (
+            resolve_event_delivery,
+            EVENT_TOOL_TELEMETRY,
+            DELIVERY_OFF,
+        )
+
+        config = {
+            "display": {
+                "platforms": {
+                    "buzz": {"event_delivery": {"tool_telemetry": False}}
+                }
+            }
+        }
+        assert (
+            resolve_event_delivery(config, "buzz", EVENT_TOOL_TELEMETRY)
+            == DELIVERY_OFF
+        )
+
+    def test_unknown_event_class_raises(self):
+        import pytest
+        from gateway.display_config import resolve_event_delivery
+
+        with pytest.raises(ValueError):
+            resolve_event_delivery({}, "buzz", "not_a_real_event_class")
+
+
+class TestBuzzWorkingIndicatorPublisher:
+    """The Buzz adapter exposes a local ephemeral 'agent busy' publisher
+    that composer surfaces can render. Nothing goes over the wire."""
+
+    def _adapter(self):
+        from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+        buzz_mod = load_plugin_adapter("buzz")
+        from gateway.config import PlatformConfig, Platform
+
+        adapter = buzz_mod.BuzzAdapter(
+            PlatformConfig(enabled=True, token="***"),
+            Platform("buzz"),
+        )
+        return adapter
+
+    def test_publish_and_get_working_indicator(self):
+        adapter = self._adapter()
+        assert adapter.get_working_indicator("chan-1") is None
+        adapter.publish_working_indicator("chan-1", "⏳ Working — 3 min")
+        entry = adapter.get_working_indicator("chan-1")
+        assert entry is not None
+        assert entry["busy"] is True
+        assert entry["text"] == "⏳ Working — 3 min"
+        assert entry["chat_id"] == "chan-1"
+
+    def test_clear_working_indicator(self):
+        adapter = self._adapter()
+        adapter.publish_working_indicator("chan-1", "busy")
+        adapter.clear_working_indicator("chan-1")
+        assert adapter.get_working_indicator("chan-1") is None
+
+    def test_publish_empty_text_stored_as_none(self):
+        adapter = self._adapter()
+        adapter.publish_working_indicator("chan-1", "  ")
+        entry = adapter.get_working_indicator("chan-1")
+        assert entry is not None
+        assert entry["text"] is None
+
+    def test_publish_ignores_missing_chat_id(self):
+        adapter = self._adapter()
+        adapter.publish_working_indicator("", "busy")
+        assert adapter.get_working_indicator("") is None
+
+
