@@ -4594,6 +4594,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 _fire_first_delta()
                                 agent._fire_stream_delta(text)
                                 deltas_were_sent["yes"] = True
+                            # Tool-use turns suppress regular text streaming
+                            # (see the chat_completions branch above for the
+                            # rationale).  Anthropic latches has_tool_use for
+                            # the remainder of the message, so any text block
+                            # emitted AFTER a tool_use block was dropped
+                            # outright and never recovered -- the ACP client
+                            # suppresses the final full-message send once
+                            # streamed_message is True.  Mirror the
+                            # chat_completions fallback so suppressed text
+                            # still reaches consumers and is recorded for
+                            # dedupe.
+                            elif text and agent.stream_delta_callback:
+                                try:
+                                    agent.stream_delta_callback(text)
+                                    agent._record_streamed_assistant_text(text)
+                                except Exception:
+                                    pass
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
