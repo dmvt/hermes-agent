@@ -427,3 +427,95 @@ class TestEmailMultiImage:
         assert "alt 0" in body
 
 
+# ---------------------------------------------------------------------------
+# Dispatcher single-attempt semantics (triage fi_6fa8864e)
+# ---------------------------------------------------------------------------
+#
+# The image-lane and file-lane must not both dispatch the same underlying
+# artifact.  Duplicate references (MEDIA: + bare path, or two bare paths)
+# reduce to a single delivery attempt through the partition + dedup path in
+# ``BasePlatformAdapter._process_message_background``.
+
+
+class TestSingleAttemptPerArtifact:
+
+    @pytest.mark.asyncio
+    async def test_duplicate_image_path_dispatched_once(self, tmp_path, monkeypatch):
+        """Same PNG mentioned twice (MEDIA + bare) → one send_multiple_images
+        batch containing exactly one entry, no separate send_document call."""
+        from unittest.mock import AsyncMock as _AsyncMock
+
+        from gateway.config import Platform
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            MessageEvent,
+            MessageType,
+            SendResult,
+        )
+        from gateway.session import SessionSource, build_session_key
+
+        root = tmp_path / "media-cache"
+        root.mkdir()
+        image = root / "graph.png"
+        image.write_bytes(b"\x89PNG fake")
+        image = image.resolve()
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (root,),
+        )
+
+        class _Adapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+
+            async def connect(self, *, is_reconnect: bool = False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def send(self, chat_id, content=None, **kwargs):
+                return SendResult(success=True, message_id="text")
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id, "type": "dm"}
+
+        adapter = _Adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            thread_id=None,
+        )
+        event = MessageEvent(
+            text="give me the chart",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="msg-1",
+        )
+        adapter._message_handler = _AsyncMock(
+            return_value=(
+                f"MEDIA:{image}\n"
+                f"See also {image} — same file."
+            )
+        )
+        adapter.send_multiple_images = _AsyncMock(return_value=None)
+        adapter.send_document = _AsyncMock(
+            return_value=SendResult(success=True, message_id="doc")
+        )
+        adapter.send_image_file = _AsyncMock(
+            return_value=SendResult(success=True, message_id="image")
+        )
+        adapter._bounded_history_media_paths_for_session = _AsyncMock(
+            return_value=set()
+        )
+
+        await adapter._process_message_background(event, build_session_key(source))
+
+        # Single-attempt: batched image call fires once with one entry, and
+        # no cross-lane duplicate fires through the document path.
+        adapter.send_multiple_images.assert_awaited_once()
+        images_kwarg = adapter.send_multiple_images.await_args.kwargs["images"]
+        assert len(images_kwarg) == 1
+        adapter.send_document.assert_not_awaited()
+

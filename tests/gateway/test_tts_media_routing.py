@@ -86,6 +86,70 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_document.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_base_adapter_routes_document_media_tag_to_send_document_with_thread(
+    tmp_path, monkeypatch,
+):
+    """A ``MEDIA:<doc>`` tag on a threaded event must route through
+    ``send_document`` and preserve the thread routing metadata (triage
+    fi_6fa8864e — Buzz previously fell through to the base fallback and
+    surfaced a generic warning instead of uploading the document)."""
+    adapter = _MediaRoutingAdapter()
+    event = _event(thread_id="topic-42")
+    doc = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter._message_handler = AsyncMock(return_value=f"Here is the report.\nMEDIA:{doc}")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
+    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
+    adapter.send_multiple_images = AsyncMock(return_value=None)
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.send_document.assert_awaited_once()
+    doc_kwargs = adapter.send_document.await_args.kwargs
+    assert doc_kwargs["chat_id"] == "chat-1"
+    assert doc_kwargs["file_path"] == str(doc)
+    # Thread metadata must carry over so the reply lands on the same topic.
+    assert doc_kwargs["metadata"].get("thread_id") == "topic-42"
+    # And the media path must not have leaked into the visible text.
+    text_call = adapter.send.await_args
+    assert text_call is not None
+    assert str(doc) not in text_call.args[1]
+
+
+@pytest.mark.asyncio
+async def test_base_adapter_single_delivery_per_artifact_dedups_media_and_bare_path(
+    tmp_path, monkeypatch,
+):
+    """Same artifact referenced by MEDIA: and again as a bare path must
+    produce exactly ONE delivery attempt (triage fi_6fa8864e — never
+    independent file+image attempts with duplicate failure notices)."""
+    adapter = _MediaRoutingAdapter()
+    event = _event(thread_id="topic-1")
+    doc = _allowed_media_path(tmp_path, monkeypatch, "spec.pdf")
+    # First reference via MEDIA: (extract_media strips it); second bare
+    # reference in the visible prose (extract_local_files picks it up).
+    adapter._message_handler = AsyncMock(
+        return_value=(
+            f"MEDIA:{doc}\n"
+            f"Also see {doc} — same file, mentioned twice."
+        )
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+    adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
+    adapter.send_voice = AsyncMock(return_value=SendResult(success=True, message_id="voice"))
+    adapter.send_multiple_images = AsyncMock(return_value=None)
+    # Bypass session-history dedup so this test isolates the in-turn dedup.
+    adapter._bounded_history_media_paths_for_session = AsyncMock(return_value=set())
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.send_document.await_count == 1, (
+        f"expected exactly one send_document attempt, got "
+        f"{adapter.send_document.await_count}"
+    )
+
+
 def _fake_runner(thread_meta):
     """Build a fake GatewayRunner-like object with the helper methods needed by
     _deliver_media_from_response."""
