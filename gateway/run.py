@@ -5740,9 +5740,37 @@ class TurnRunner:
             for queued in pending:
                 _deliver_bg_review_message(queued)
 
-        # Background review delivery — send "💾 Memory updated" etc. to user
+        # Background review delivery — send "💾 Memory updated" etc. to user.
+        #
+        # fi_a18c64a3: agent_activity notices (background_review
+        # Self-improvement summaries, memory-updated pings) route through
+        # ``resolve_event_delivery(..., EVENT_AGENT_ACTIVITY)``. Platforms
+        # whose policy is anything other than ``chat`` (Buzz defaults to
+        # ``audit``) MUST NOT push these into the user conversation as an
+        # unsolicited channel message; the notice still lands on stdout /
+        # the audit surface through the caller in agent/background_review.
+        try:
+            from gateway.display_config import (
+                resolve_event_delivery as _resolve_event_delivery,
+                EVENT_AGENT_ACTIVITY as _EVENT_AGENT_ACTIVITY,
+                DELIVERY_CHAT as _DELIVERY_CHAT,
+            )
+            _bg_review_delivery = _resolve_event_delivery(
+                ctx.user_config,
+                _platform_config_key(ctx.source.platform),
+                _EVENT_AGENT_ACTIVITY,
+            )
+        except Exception:
+            _bg_review_delivery = "chat"
+
         def _bg_review_send(message: str) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
+                return
+            if _bg_review_delivery != "chat":
+                # Non-chat surfaces (audit/operator/ephemeral/off) —
+                # agent/background_review already handles the audit /
+                # stdout side via agent._safe_print; nothing to push into
+                # the user's conversation on those platforms.
                 return
             if not _bg_review_release.is_set():
                 with _bg_review_pending_lock:
@@ -10627,6 +10655,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info(
                         "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
                         platform_str,
+                    )
+                    continue
+
+                # fi_a18c64a3 — the "Gateway shutting down" warning is a
+                # lifecycle event. On platforms whose policy routes
+                # ``lifecycle`` away from durable chat (Buzz defaults to
+                # ``operator``) skip the per-session push: the home-channel
+                # / operator broadcast below is the correct surface, and
+                # posting it into an active user thread turns the operator
+                # signal into an unsolicited agent message.
+                try:
+                    from gateway.display_config import (
+                        resolve_event_delivery as _resolve_event_delivery,
+                        EVENT_LIFECYCLE as _EVENT_LIFECYCLE,
+                        DELIVERY_CHAT as _DELIVERY_CHAT,
+                    )
+                    _lifecycle_target = _resolve_event_delivery(
+                        _load_gateway_config(),
+                        _platform_config_key(platform),
+                        _EVENT_LIFECYCLE,
+                    )
+                except Exception:
+                    _lifecycle_target = "chat"
+                if _lifecycle_target != "chat":
+                    logger.info(
+                        "Shutdown notification suppressed for active session: "
+                        "%s event_delivery.lifecycle=%s (routed to %s surface)",
+                        platform_str, _lifecycle_target, _lifecycle_target,
                     )
                     continue
 
@@ -27341,7 +27397,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         platform_key = _platform_config_key(source.platform)
         user_config = _load_gateway_config()
-        from gateway.display_config import resolve_display_setting
+        from gateway.display_config import (
+            resolve_display_setting,
+            resolve_event_delivery,
+            EVENT_TOOL_TELEMETRY,
+            EVENT_AGENT_ACTIVITY,
+            EVENT_LIFECYCLE,
+            DELIVERY_CHAT,
+            DELIVERY_EPHEMERAL,
+        )
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
@@ -28512,6 +28576,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _long_running_mode == "generic"
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
+                # fi_a18c64a3 — heartbeat is tool_telemetry. On platforms
+                # whose delivery policy routes tool_telemetry away from chat
+                # (e.g. Buzz → ephemeral working-indicator), publish the
+                # busy state locally instead of durably posting a channel
+                # message. For any other policy that isn't durable chat
+                # (audit/operator/off), just skip: those surfaces are
+                # already served by other subsystems and there is no user-
+                # facing chat obligation here.
+                try:
+                    _telemetry_target = resolve_event_delivery(
+                        user_config,
+                        platform_key,
+                        EVENT_TOOL_TELEMETRY,
+                    )
+                except Exception as _tp:
+                    logger.debug("event_delivery resolve failed: %s", _tp)
+                    _telemetry_target = DELIVERY_CHAT
+                if _telemetry_target != DELIVERY_CHAT:
+                    if _telemetry_target == DELIVERY_EPHEMERAL:
+                        _publish = getattr(
+                            _notify_adapter, "publish_working_indicator", None
+                        )
+                        if callable(_publish):
+                            try:
+                                _publish(
+                                    source.chat_id,
+                                    _heartbeat_text,
+                                    metadata=_status_thread_metadata,
+                                )
+                            except Exception as _pe:
+                                logger.debug(
+                                    "publish_working_indicator failed: %s", _pe
+                                )
+                    # audit/operator/off — no chat post for tool telemetry.
+                    continue
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -29262,6 +29361,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+
+            # fi_a18c64a3 / fi_1a5a623902abd8558f9b — clear any ephemeral
+            # "agent busy" indicator we published so a stale composer hint
+            # never outlives the run. Best-effort: adapters without the
+            # publisher simply lack the attribute.
+            try:
+                _wi_adapter = self._adapter_for_source(source)
+                _clear_wi = getattr(_wi_adapter, "clear_working_indicator", None)
+                if callable(_clear_wi):
+                    _clear_wi(source.chat_id)
+            except Exception:
+                pass
 
             # Wait for stream consumer to finish its final edit
             if stream_task:

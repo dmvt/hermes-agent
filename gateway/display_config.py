@@ -17,6 +17,28 @@ Backward compatibility: ``display.tool_progress_overrides`` is still read as a
 fallback for ``tool_progress`` when no ``display.platforms`` entry exists.  A
 config migration (version bump) automatically moves the old format into the new
 ``display.platforms`` structure.
+
+Event classes and per-platform delivery policy (fi_a18c64a3):
+    ``resolve_event_delivery(cfg, platform, event_class)`` maps a gateway
+    event (tool telemetry, milestone, terminal result, agent activity,
+    lifecycle warning) to the surface it lands on for that platform:
+
+        chat      — a durable in-thread chat message the user sees inline
+        ephemeral — a transient "working" indicator (composer/typing surface)
+        audit     — an audit/activity log surface (never user-facing chat)
+        operator  — an operator/home-channel surface (not user chat)
+        off       — suppressed entirely
+
+    The policy defaults ensure that on Buzz — a permanent-message relay
+    where every send is a durable event visible to a channel — tool
+    telemetry is NEVER posted as a chat message. It is routed instead to
+    an in-memory working-indicator publisher that the composer area can
+    render locally. Milestones and exactly one terminal result stay
+    threaded in-chat. Agent activity notices (e.g. background_review
+    "Self-improvement review: ...") route to audit surfaces, never to a
+    channel. Lifecycle warnings (e.g. Gateway-shutting-down interrupt
+    reasons) route to the operator surface, never as unsolicited assistant
+    messages inside a user conversation.
 """
 
 from __future__ import annotations
@@ -329,3 +351,152 @@ def _normalise(setting: str, value: Any) -> Any:
         except (TypeError, ValueError):
             return 0
     return value
+
+
+# ---------------------------------------------------------------------------
+# Event classes and per-platform delivery policy (fi_a18c64a3)
+# ---------------------------------------------------------------------------
+# Explicit taxonomy for the gateway-emitted signal types so that platforms
+# whose transports are permanent-write (no message edit, no ephemeral typing
+# text) can route each class to the surface that fits it — instead of
+# defaulting to "post another durable chat message". Each class carries a
+# short intent contract:
+#
+#   tool_telemetry  — running-tool progress, "still working" heartbeats,
+#                     compact status bubbles. High-frequency, low-value once
+#                     the turn ends. On permanent-write platforms it MUST NOT
+#                     durably post to chat.
+#   milestone       — meaningful mid-turn events (interim assistant
+#                     commentary, streamed chunks). Should reach chat.
+#   terminal_result — the single final response for a turn. Always chat;
+#                     exactly one per turn regardless of platform.
+#   agent_activity  — background/adjacent-agent notices unrelated to the
+#                     user's current question (background_review
+#                     Self-improvement summaries, memory-updated notices,
+#                     compaction receipts). Never unsolicited channel spam.
+#   lifecycle       — gateway lifecycle warnings the user didn't ask for
+#                     (Gateway shutting down / restarting interrupt hints,
+#                     drain notices). Operator surface only.
+
+EVENT_TOOL_TELEMETRY = "tool_telemetry"
+EVENT_MILESTONE = "milestone"
+EVENT_TERMINAL_RESULT = "terminal_result"
+EVENT_AGENT_ACTIVITY = "agent_activity"
+EVENT_LIFECYCLE = "lifecycle"
+
+EVENT_CLASSES = frozenset({
+    EVENT_TOOL_TELEMETRY,
+    EVENT_MILESTONE,
+    EVENT_TERMINAL_RESULT,
+    EVENT_AGENT_ACTIVITY,
+    EVENT_LIFECYCLE,
+})
+
+# Delivery targets. A resolver returns exactly one of these strings — the
+# caller decides how to render it (send() to chat, publish a working
+# indicator, log to audit, notify the operator surface, or suppress).
+DELIVERY_CHAT = "chat"          # durable in-conversation message
+DELIVERY_EPHEMERAL = "ephemeral"  # transient/composer working indicator
+DELIVERY_AUDIT = "audit"        # audit log / activity feed, no chat
+DELIVERY_OPERATOR = "operator"  # operator / home-channel surface, no chat
+DELIVERY_OFF = "off"            # suppressed entirely
+
+DELIVERY_TARGETS = frozenset({
+    DELIVERY_CHAT,
+    DELIVERY_EPHEMERAL,
+    DELIVERY_AUDIT,
+    DELIVERY_OPERATOR,
+    DELIVERY_OFF,
+})
+
+# Global default policy — pre-fi_a18c64a3 behaviour for legacy platforms
+# that already accept durable telemetry / activity / lifecycle posts.
+_EVENT_GLOBAL_DEFAULTS: dict[str, str] = {
+    EVENT_TOOL_TELEMETRY: DELIVERY_CHAT,
+    EVENT_MILESTONE: DELIVERY_CHAT,
+    EVENT_TERMINAL_RESULT: DELIVERY_CHAT,
+    EVENT_AGENT_ACTIVITY: DELIVERY_CHAT,
+    EVENT_LIFECYCLE: DELIVERY_CHAT,
+}
+
+# Per-platform policy overrides. Keys omitted here fall back to the global
+# default. Buzz is the flagship case — a permanent-write Nostr relay where
+# every send is a durable channel event; each event class must be routed
+# to its natural surface instead of dumping into the conversation.
+_PLATFORM_EVENT_DELIVERY: dict[str, dict[str, str]] = {
+    "buzz": {
+        EVENT_TOOL_TELEMETRY: DELIVERY_EPHEMERAL,
+        EVENT_MILESTONE: DELIVERY_CHAT,
+        EVENT_TERMINAL_RESULT: DELIVERY_CHAT,
+        EVENT_AGENT_ACTIVITY: DELIVERY_AUDIT,
+        EVENT_LIFECYCLE: DELIVERY_OPERATOR,
+    },
+}
+
+
+def _normalise_delivery(value: Any) -> Any:
+    """Coerce a user-supplied delivery value into a canonical target string."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return DELIVERY_CHAT if value else DELIVERY_OFF
+    val = str(value).strip().lower()
+    if val in {"true", "yes", "on", "1"}:
+        return DELIVERY_CHAT
+    if val in {"false", "no", "0", "none", "null"}:
+        return DELIVERY_OFF
+    return val if val in DELIVERY_TARGETS else None
+
+
+def resolve_event_delivery(
+    user_config: dict,
+    platform_key: str,
+    event_class: str,
+) -> str:
+    """Resolve the delivery target for one event class on one platform.
+
+    Resolution order (first non-None wins):
+        1. ``display.platforms.<platform>.event_delivery.<class>`` — explicit
+           per-platform user override.
+        2. ``display.event_delivery.<class>`` — global user override.
+        3. ``_PLATFORM_EVENT_DELIVERY[<platform>][<class>]`` — built-in
+           per-platform default.
+        4. ``_EVENT_GLOBAL_DEFAULTS[<class>]`` — built-in global default
+           (``DELIVERY_CHAT`` for every class).
+
+    Unknown ``event_class`` values raise ``ValueError`` — callers must use
+    one of the ``EVENT_*`` constants so typos are surfaced loudly instead
+    of silently degrading to the legacy chat behaviour.
+    """
+    if event_class not in EVENT_CLASSES:
+        raise ValueError(f"Unknown event_class: {event_class!r}")
+
+    display_cfg = user_config.get("display") if isinstance(user_config, dict) else None
+    display_cfg = display_cfg or {}
+
+    # 1. Explicit per-platform override
+    platforms = display_cfg.get("platforms") or {}
+    plat_overrides = platforms.get(platform_key)
+    if isinstance(plat_overrides, dict):
+        plat_events = plat_overrides.get("event_delivery")
+        if isinstance(plat_events, dict):
+            val = _normalise_delivery(plat_events.get(event_class))
+            if val is not None:
+                return val
+
+    # 2. Global user override
+    global_events = display_cfg.get("event_delivery")
+    if isinstance(global_events, dict):
+        val = _normalise_delivery(global_events.get(event_class))
+        if val is not None:
+            return val
+
+    # 3. Built-in per-platform default
+    plat_defaults = _PLATFORM_EVENT_DELIVERY.get(platform_key)
+    if plat_defaults:
+        val = plat_defaults.get(event_class)
+        if val is not None:
+            return val
+
+    # 4. Built-in global default
+    return _EVENT_GLOBAL_DEFAULTS[event_class]
