@@ -180,6 +180,46 @@ def schnorr_sign(
     return nonce_x + signature_scalar.to_bytes(32, "big")
 
 
+def build_event(
+    *,
+    private_key: str,
+    kind: int,
+    tags: list[list[str]],
+    content: str = "",
+    created_at: Optional[int] = None,
+    auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build and sign an arbitrary Nostr event (NIP-01 id + BIP-340 sig).
+
+    The id is sha256 over the canonical serialization
+    ``[0, pubkey, created_at, kind, tags, content]`` with compact separators —
+    exactly what every relay recomputes to validate the id. Kept generic so
+    callers can publish any kind (NIP-42 auth, ephemeral typing indicators,
+    …) through one audited signing path.
+    """
+    pubkey = public_key_hex(private_key)
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    serialized = json.dumps(
+        [0, pubkey, timestamp, int(kind), tags, content],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    event_id = hashlib.sha256(serialized).digest()
+    return {
+        "id": event_id.hex(),
+        "pubkey": pubkey,
+        "created_at": timestamp,
+        "kind": int(kind),
+        "tags": tags,
+        "content": content,
+        "sig": schnorr_sign(
+            event_id,
+            private_key,
+            auxiliary_randomness=auxiliary_randomness,
+        ).hex(),
+    }
+
+
 def build_auth_event(
     *,
     private_key: str,
@@ -207,24 +247,11 @@ def build_auth_event(
             raise ValueError("BUZZ_AUTH_TAG must be a four-string auth tag")
         tags.append(auth_tag)
 
-    pubkey = public_key_hex(private_key)
-    timestamp = int(time.time()) if created_at is None else int(created_at)
-    serialized = json.dumps(
-        [0, pubkey, timestamp, 22242, tags, ""],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode()
-    event_id = hashlib.sha256(serialized).digest()
-    return {
-        "id": event_id.hex(),
-        "pubkey": pubkey,
-        "created_at": timestamp,
-        "kind": 22242,
-        "tags": tags,
-        "content": "",
-        "sig": schnorr_sign(
-            event_id,
-            private_key,
-            auxiliary_randomness=auxiliary_randomness,
-        ).hex(),
-    }
+    return build_event(
+        private_key=private_key,
+        kind=22242,
+        tags=tags,
+        content="",
+        created_at=created_at,
+        auxiliary_randomness=auxiliary_randomness,
+    )

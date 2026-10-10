@@ -108,6 +108,14 @@ _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 
+# Ephemeral typing indicator (fi_1a5a623902abd8558f9b). Buzz Web's receiver
+# pins this at 20002 (src/lib/kinds.ts:121 KIND_TYPING_INDICATOR) and upstream
+# agrees (desktop/src/shared/constants/kinds.ts). Nostr reserves 20000-29999
+# for ephemeral events: relays forward them to live subscribers and never
+# persist them, which is what makes this safe to publish on a relay whose
+# chat kinds are permanent.
+_TYPING_INDICATOR_KIND = 20002
+
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
@@ -441,6 +449,10 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        # Live authenticated socket, set by _websocket_loop while connected.
+        # Outbound EVENT publishes (typing indicators) ride this rather than
+        # opening a second connection, so they inherit the NIP-42 session.
+        self._ws_connection: Optional[Any] = None
         self._membership_since = 0
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
@@ -596,6 +608,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        self._ws_connection = None
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -732,8 +745,72 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
-        pass
+        """Publish an ephemeral kind-20002 typing indicator for ``chat_id``.
+
+        fi_1a5a623902abd8558f9b. Buzz Web has rendered typing indicators all
+        along (``src/lib/workspace-state.ts`` subscribes to kind 20002 scoped
+        to the active channel; ``TypingIndicator`` renders above the composer)
+        — nothing published them for the agent, so Fran saw a silent gap
+        between his message and the reply. Upstream treats the same event as
+        the fallback "agent is working" signal when no kind-24200 observer
+        stream exists for a scope (``desktop/src/features/agents/
+        agentWorkingSignal.ts:21-24``, fed by ``reportChannelBotTyping``), so
+        publishing it here is the parity-correct mechanism rather than a
+        local invention.
+
+        Wire contract, from the receiver (``src/lib/typing.ts``):
+
+        * kind 20002, content ``""``, tag ``["h", <channelId>]``;
+        * a thread-scoped indicator adds a NIP-10 ``reply``-marked e-tag —
+          ``typingScopeId`` derives the scope ONLY from a ``reply`` marker, so
+          a ``root``-only anchor would be misfiled to the channel bottom bar;
+        * there is no "stopped typing" event. Cessation is receiver-side: an
+          8s TTL from ``created_at``, plus suppression once the author's own
+          message lands. That is why this method needs no explicit clear —
+          base.py's ``_keep_typing`` refreshes every ~2s for the life of the
+          turn and simply stops, and the reply itself clears the indicator.
+
+        Delivery rides the existing NIP-42-authenticated WebSocket. When the
+        adapter is on the polling transport there is no socket to publish on,
+        so this stays a no-op — the CLI has no typing subcommand (every
+        command under messages/users/reactions/agents was checked), and a
+        durable ``messages send`` would post a visible chat message, which is
+        precisely the wrong thing on a permanent-write relay.
+        """
+        if not chat_id:
+            return
+        websocket = self._ws_connection
+        if websocket is None or not self._ws_active or not self._private_key:
+            return
+        try:
+            build_event = _load_nostr_auth().build_event
+            event = build_event(
+                private_key=self._private_key,
+                kind=_TYPING_INDICATOR_KIND,
+                tags=self._typing_tags(str(chat_id), metadata),
+                content="",
+            )
+            await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+        except Exception as e:
+            # Best-effort: a typing indicator must never break a turn, and
+            # _keep_typing will try again on its next ~2s tick.
+            logger.debug("Buzz: typing indicator publish failed: %s", e)
+
+    def _typing_tags(self, chat_id: str, metadata=None) -> List[List[str]]:
+        """Tags for a typing indicator, thread-scoped when the turn is threaded.
+
+        The thread anchor is the SAME stable root the reply will be sent to
+        (``_resolve_send_reply_target``), so the indicator appears in the
+        thread panel the answer lands in rather than at the channel bottom.
+        It is emitted as a ``reply``-marked e-tag because that is the only
+        marker ``typingScopeId`` reads (src/lib/typing.ts); the web thread
+        model is flat, so parent and root coincide.
+        """
+        tags: List[List[str]] = [["h", chat_id]]
+        thread_root = self._resolve_send_reply_target(chat_id, None, metadata)
+        if thread_root:
+            tags.append(["e", str(thread_root), "", "reply"])
+        return tags
 
     # ── Working-indicator publisher (fi_a18c64a3 / fi_1a5a623902abd8558f9b) ──
     #
@@ -1118,6 +1195,7 @@ class BuzzAdapter(BasePlatformAdapter):
         except (asyncio.TimeoutError, TimeoutError):
             logger.warning("Buzz: WebSocket did not authenticate in time")
             self._ws_active = False
+            self._ws_connection = None
             if self._ws_task and not self._ws_task.done():
                 self._ws_task.cancel()
                 try:
@@ -1226,6 +1304,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
+                        self._ws_connection = websocket
                         self._ws_active = True
                         if self._ws_ready is not None:
                             self._ws_ready.set()
@@ -1260,11 +1339,13 @@ class BuzzAdapter(BasePlatformAdapter):
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._ws_connection = None
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._ws_connection = None
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
