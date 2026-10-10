@@ -887,6 +887,79 @@ class TestBuzzSendAttachmentReceiptVerification:
         assert BuzzAdapter._receipt_confirms_attachment(payload) is False
 
 
+# ── Seen-reaction ordering ────────────────────────────────────────────────
+
+
+class TestSeenReactionOrdering:
+    """The 👀 ack must be published on acceptance, not after the turn.
+
+    Regression guard for fi_8f9e23fe05469b7a52f5. ``handle_message`` runs the
+    agent's entire turn and is awaited, so reacting after it returned put the
+    acknowledgement *behind* the reply it was meant to precede.
+    """
+
+    def _adapter_with_trace(self, *, reaction_raises=False, reaction_delay=0.0):
+        a = _make_adapter()
+        a.cli_path = "/fake/buzz"
+        trace = []
+
+        async def fake_reaction(chat_id, message_id, emoji):
+            if reaction_delay:
+                await asyncio.sleep(reaction_delay)
+            trace.append(("reaction", chat_id, message_id, emoji))
+            if reaction_raises:
+                raise RuntimeError("relay refused the reaction")
+            return True
+
+        async def fake_handle(event):
+            trace.append(("turn", event.message_id))
+
+        a.send_reaction = fake_reaction
+        a.handle_message = fake_handle
+        a._message_handler = AsyncMock()
+        return a, trace
+
+    async def _dispatch(self, adapter):
+        await adapter._dispatch_message(
+            text="@Chip hello",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Fran",
+            message_id="e" * 64,
+            created_at=1000,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reaction_is_sent_before_the_turn_runs(self):
+        adapter, trace = self._adapter_with_trace()
+        await self._dispatch(adapter)
+        assert [step[0] for step in trace] == ["reaction", "turn"]
+        assert trace[0][1:] == (CHANNEL, "e" * 64, "👀")
+
+    @pytest.mark.asyncio
+    async def test_a_raising_reaction_never_blocks_the_turn(self):
+        """Best-effort means the dispatch still happens if the ack fails."""
+        adapter, trace = self._adapter_with_trace(reaction_raises=True)
+        await self._dispatch(adapter)
+        assert [step[0] for step in trace] == ["reaction", "turn"]
+
+    @pytest.mark.asyncio
+    async def test_a_slow_reaction_still_precedes_the_turn(self):
+        adapter, trace = self._adapter_with_trace(reaction_delay=0.01)
+        await self._dispatch(adapter)
+        assert [step[0] for step in trace] == ["reaction", "turn"]
+
+    @pytest.mark.asyncio
+    async def test_no_handler_means_no_reaction_and_no_turn(self):
+        """Without a message handler the adapter returns before either side
+        effect, so an unconfigured adapter does not emit a bare ack."""
+        adapter, trace = self._adapter_with_trace()
+        adapter._message_handler = None
+        await self._dispatch(adapter)
+        assert trace == []
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
 

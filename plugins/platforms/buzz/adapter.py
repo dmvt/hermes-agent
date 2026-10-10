@@ -1637,14 +1637,24 @@ class BuzzAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
         )
 
-        await self.handle_message(event)
-        
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
+        # Publish the "seen" reaction BEFORE dispatching the turn.
+        #
+        # handle_message runs the agent's entire turn — thinking, tool calls,
+        # and the reply — and it is awaited. Reacting after it returned meant
+        # the acknowledgement landed *after* the answer the user was waiting
+        # for, which is useless as an ack (fi_8f9e23fe05469b7a52f5). Sending it
+        # on acceptance makes it arrive within about a second of the message.
+        #
+        # This stays strictly best-effort: send_reaction already swallows CLI
+        # failures and returns False, and the try/except guards anything it
+        # raises, so a failed or slow reaction must never block or skip the
+        # dispatch below.
         try:
             await self.send_reaction(chat_id, message_id, "👀")
         except Exception:
             logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+
+        await self.handle_message(event)
 
 
 # ---------------------------------------------------------------------------
